@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""MarketDesign.ai TRACK V20.3 — automated external ACER collector.
+"""MarketDesign.ai TRACK V20.4 — automated external ENTSO-E collector.
 
-Runs outside Cloudflare Workers. It discovers ACER electricity decisions, fetches
-source PDFs, normalises them to the existing TRACK /ingest/document contract,
-deduplicates by source_id + content hash, and optionally submits them.
+Runs outside Cloudflare Workers. It discovers ENTSO-E consultations, fetches
+source content, normalises it to the existing TRACK /ingest/document contract,
+deduplicates by source_id + content hash, and optionally submits it.
 """
 from __future__ import annotations
 
@@ -26,25 +26,28 @@ import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
-VERSION = "v20.3-acer-automation-1"
+VERSION = "v20.4-entsoe-automation-1"
 DEFAULT_TRACK_URL = "https://marketdesign-track-api.philvass.workers.dev/ingest/document"
-ACER_SEARCH_URL = (
-    "https://www.acer.europa.eu/documents/search?"
-    "f%5B0%5D=area%3A45&f%5B1%5D=type_of_publication%3A30"
-)
-ACER_FALLBACK_URL = (
-    "https://www.acer.europa.eu/documents/official-documents/individual-decisions?page=0"
-)
+ENTSOE_CONSULTATIONS_URL = "https://consultations.entsoe.eu/"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
-    "MarketDesign.ai-TRACK/20.3"
+    "MarketDesign.ai-TRACK/20.4"
 )
-DATE_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
-DECISION_RE = re.compile(r"\bDecision\s+(?:No\s+)?0?(\d{1,2})[-/]?(20\d{2})\b", re.I)
+DATE_RE = re.compile(
+    r"\b(?:Opened|Closes|Closed)\s+(\d{1,2})\s+"
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(20\d{2})\b",
+    re.I,
+)
+
+MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "may": 5, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 
-@dataclass(frozen=True)
+@dataclass
 class Candidate:
     source_id: str
     title: str
@@ -84,77 +87,69 @@ def get_with_retry(session: requests.Session, url: str, timeout: int = 30, attem
     raise CollectorError(f"GET failed for {url}: {last}")
 
 
-def normalise_date(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    try:
-        return datetime.strptime(raw, "%d.%m.%Y").date().isoformat()
-    except ValueError:
-        return None
+def normalise_entsoe_date(day: str, month: str, year: str) -> str:
+    return datetime(
+        int(year),
+        MONTHS[month.lower()],
+        int(day),
+    ).date().isoformat()
 
 
-def source_id_from_title(title: str) -> str:
-    m = DECISION_RE.search(title)
-    if m:
-        return f"acer-decision-{int(m.group(1)):02d}-{m.group(2)}"
-    digest = hashlib.sha256(title.encode("utf-8")).hexdigest()[:16]
-    return f"acer-{digest}"
-
-
-def _nearest_date(anchor) -> str | None:
-    # ACER cards place the date shortly before the decision link. Walk previous
-    # rendered strings so this remains resilient to small Drupal markup changes.
-    seen = 0
-    for text in anchor.find_all_previous(string=True):
-        value = " ".join(str(text).split())
-        if not value:
-            continue
-        seen += len(value)
-        m = DATE_RE.search(value)
-        if m:
-            return normalise_date(m.group(1))
-        if seen > 1200:
-            break
-    return None
+def source_id_from_url(url: str) -> str:
+    path = url.split("?", 1)[0].strip("/").split("/")
+    slug = "-".join(path[-2:]).lower()
+    slug = re.sub(r"[^a-z0-9-]+", "-", slug).strip("-")
+    return f"entsoe-consultation-{slug}"
 
 
 def parse_candidates(html: str, base_url: str) -> list[Candidate]:
     soup = BeautifulSoup(html, "html.parser")
     found: dict[str, Candidate] = {}
+
     for a in soup.find_all("a", href=True):
         title = " ".join(a.get_text(" ", strip=True).split())
-        if not title or "annex" in title.lower():
-            continue
-        if not DECISION_RE.search(title):
-            continue
-        # Avoid administrative-board decisions and unrelated link text.
-        if not title.lower().startswith("acer decision"):
-            continue
         url = urljoin(base_url, a["href"])
-        sid = source_id_from_title(title)
-        cand = Candidate(
-            source_id=sid,
-            title=title,
-            publication_date=_nearest_date(a),
-            url=url,
+
+        if not title:
+            continue
+        if "consultations.entsoe.eu" not in url:
+            continue
+        if url.rstrip("/") == base_url.rstrip("/"):
+            continue
+        if "/consultation_finder/" in url:
+            continue
+        if "/user_uploads/" in url:
+            continue
+        if url.lower().endswith(".pdf"):
+            continue
+
+        # Consultation detail pages use paths such as /markets/ishm-assessment/.
+        path_parts = [p for p in url.split("?", 1)[0].split("/") if p]
+        if len(path_parts) < 2:
+            continue
+
+        sid = source_id_from_url(url)
+
+        # Avoid duplicate menu/footer links to the same consultation.
+        found.setdefault(
+            sid,
+            Candidate(
+                source_id=sid,
+                title=title,
+                publication_date=None,
+                url=url,
+            ),
         )
-        # First occurrence on ACER's listing is the primary decision file.
-        found.setdefault(sid, cand)
+
     return list(found.values())
 
 
 def discover(session: requests.Session) -> tuple[str, list[Candidate]]:
-    errors: list[str] = []
-    for url in (ACER_SEARCH_URL, ACER_FALLBACK_URL):
-        try:
-            r = get_with_retry(session, url)
-            candidates = parse_candidates(r.text, r.url)
-            if candidates:
-                return r.url, candidates
-            errors.append(f"{url}: no decisions parsed")
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-    raise CollectorError("ACER discovery failed: " + " | ".join(errors))
+    r = get_with_retry(session, ENTSOE_CONSULTATIONS_URL)
+    candidates = parse_candidates(r.text, r.url)
+    if not candidates:
+        raise CollectorError("ENTSO-E consultation discovery returned no candidates")
+    return r.url, candidates
 
 
 def extract_pdf_text(pdf_bytes: bytes, max_chars: int = 60000) -> str:
@@ -182,6 +177,21 @@ def fetch_content(session: requests.Session, candidate: Candidate) -> str:
         text = extract_pdf_text(r.content)
     else:
         soup = BeautifulSoup(r.text, "html.parser")
+
+        page_text = soup.get_text(" ", strip=True)
+        opened = re.search(
+            r"\bOpened\s+(\d{1,2})\s+"
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(20\d{2})\b",
+            page_text,
+            re.I,
+        )
+        if opened:
+            candidate.publication_date = normalise_entsoe_date(
+                opened.group(1),
+                opened.group(2),
+                opened.group(3),
+            )
+
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
         text = "\n".join(
@@ -195,7 +205,7 @@ def fetch_content(session: requests.Session, candidate: Candidate) -> str:
 
 def build_payload(candidate: Candidate, content: str) -> dict:
     return {
-        "institution": "ACER",
+        "institution": "ENTSO-E",
         "document_type": "REGULATOR",
         "url": candidate.url,
         "publication_date": candidate.publication_date,
@@ -313,7 +323,7 @@ def choose(candidates: Iterable[Candidate], match: str | None, limit: int) -> li
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="MarketDesign.ai TRACK V20.3 automated external ACER collector")
+    p = argparse.ArgumentParser(description="MarketDesign.ai TRACK V20.4 automated external ENTSO-E collector")
     p.add_argument("--submit", action="store_true", help="POST new/changed documents into TRACK")
     p.add_argument("--dry-run", action="store_true", help="Discover + fetch + normalise, but never submit")
     p.add_argument("--bootstrap-state", action="store_true", help="Record current documents as the baseline without submitting them")
@@ -321,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--match", help="Only process candidates whose title/source_id contains this text")
     p.add_argument("--track-url", default=os.getenv("TRACK_INGEST_URL", DEFAULT_TRACK_URL))
     p.add_argument("--token", default=os.getenv("TRACK_INGEST_TOKEN"))
-    p.add_argument("--state", default=os.getenv("COLLECTOR_STATE", "./state/acer.sqlite3"))
+    p.add_argument("--state", default=os.getenv("COLLECTOR_STATE", "./state/entsoe.sqlite3"))
     p.add_argument("--json", action="store_true", help="Emit machine-readable summary JSON")
     args = p.parse_args(argv)
 
@@ -336,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     source_url, discovered = discover(session)
     selected = choose(discovered, args.match, max(1, args.limit))
     if not selected:
-        raise CollectorError(f"No ACER decision matched {args.match!r}")
+        raise CollectorError(f"No ENTSO-E consultation matched {args.match!r}")
 
     results = []
     for candidate in selected:

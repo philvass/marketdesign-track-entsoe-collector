@@ -1,4 +1,4 @@
-name: MarketDesign.ai ACER monitor
+name: MarketDesign.ai ENTSO-E monitor
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ on:
           - bootstrap
           - submit
       limit:
-        description: Maximum ACER decisions to inspect
+        description: Maximum ENTSO-E items to inspect
         required: true
         default: '25'
 
@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: marketdesign-acer-monitor
+  group: marketdesign-entsoe-monitor
   cancel-in-progress: false
 
 jobs:
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      COLLECTOR_STATE: state/acer.sqlite3
+      COLLECTOR_STATE: state/entsoe.sqlite3
       TRACK_INGEST_URL: ${{ vars.TRACK_INGEST_URL || 'https://marketdesign-track-api.philvass.workers.dev/ingest/document' }}
       TRACK_INGEST_TOKEN: ${{ secrets.TRACK_INGEST_TOKEN }}
 
@@ -53,10 +53,10 @@ jobs:
         id: state_restore
         uses: actions/cache/restore@v4
         with:
-          path: state/acer.sqlite3
-          key: acer-state-${{ github.ref_name }}-${{ github.run_id }}
+          path: state/entsoe.sqlite3
+          key: entsoe-state-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            acer-state-${{ github.ref_name }}-
+            entsoe-state-${{ github.ref_name }}-
 
       - name: Resolve run mode
         id: mode
@@ -70,15 +70,15 @@ jobs:
             echo "limit=${{ inputs.limit }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: ACER dry run
+      - name: ENTSO-E dry run
         if: steps.mode.outputs.mode == 'dry_run'
         run: python collector.py --dry-run --limit "${{ steps.mode.outputs.limit }}" --json | tee run-output.json
 
-      - name: Bootstrap current ACER catalogue
+      - name: Bootstrap current ENTSO-E catalogue
         if: steps.mode.outputs.mode == 'bootstrap'
         run: python collector.py --bootstrap-state --limit "${{ steps.mode.outputs.limit }}" --json | tee run-output.json
 
-      - name: Submit new or changed ACER decisions
+      - name: Submit new or changed ENTSO-E items
         if: steps.mode.outputs.mode == 'submit'
         run: python collector.py --submit --limit "${{ steps.mode.outputs.limit }}" --json | tee run-output.json
 
@@ -87,7 +87,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## MarketDesign.ai ACER monitor"
+            echo "## MarketDesign.ai ENTSO-E monitor"
             echo ""
             echo "- Mode: ${{ steps.mode.outputs.mode }}"
             echo "- State cache restored: ${{ steps.state_restore.outputs.cache-matched-key != '' }}"
@@ -115,13 +115,13 @@ jobs:
         if: success()
         uses: actions/cache/save@v4
         with:
-          path: state/acer.sqlite3
-          key: acer-state-${{ github.ref_name }}-${{ github.run_id }}
+          path: state/entsoe.sqlite3
+          key: entsoe-state-${{ github.ref_name }}-${{ github.run_id }}
 
       - name: Upload run report
         if: always() && hashFiles('run-output.json') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: acer-monitor-${{ github.run_id }}
+          name: entsoe-monitor-${{ github.run_id }}
           path: run-output.json
           retention-days: 14
