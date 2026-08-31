@@ -123,6 +123,19 @@ def parse_candidates(html: str, base_url: str) -> list[Candidate]:
         if url.lower().endswith(".pdf"):
             continue
 
+        # Exclude Consultation Hub navigation, legal and support pages.
+        excluded_paths = (
+            "/accessibility_policy/",
+            "/terms_and_conditions/",
+            "/cookie_policy/",
+            "/privacy_policy/",
+            "/support/",
+        )
+        if any(path in url for path in excluded_paths):
+            continue
+        if "#" in url:
+            continue
+
         # Consultation detail pages use paths such as /markets/ishm-assessment/.
         path_parts = [p for p in url.split("?", 1)[0].split("/") if p]
         if len(path_parts) < 2:
